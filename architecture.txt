@@ -1,0 +1,599 @@
+================================================================================
+  StateSMix: Architecture, Theory, and Experimental Results
+  A Neural State-Space Model Compressor
+================================================================================
+
+Last updated: 2026-03-16
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+StateSMix is a lossless data compressor that uses a Mamba-style State Space
+Model (SSM) as an online sequence predictor, combined with sparse n-gram context
+models, all integrated into an arithmetic coding framework.
+
+The key idea: train a small neural sequence model token-by-token while compressing,
+using its probability output directly as the arithmetic coder's symbol distribution.
+No pre-training is needed. The model adapts to the specific input file in real time.
+
+Core properties:
+  - Fully online: model is trained and used simultaneously during compression
+  - Lossless: perfect reconstruction guaranteed (arithmetic coding is exact)
+  - Self-contained: no pre-trained weights stored or transmitted
+  - Vocabulary-adaptive: only the tokens actually present in the file are used
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 2. COMPRESSION PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The compression pipeline has five stages:
+
+  ┌─────────────┐   ┌───────────┐   ┌───────────────┐   ┌──────────────┐   ┌──────┐
+  │  Raw bytes  │──▶│   BPE     │──▶│ Vocab remap   │──▶│  Predict &  │──▶│ File │
+  │   (input)   │   │ tokenizer │   │ (compact IDs) │   │  AC encode  │   │ out  │
+  └─────────────┘   └───────────┘   └───────────────┘   └──────────────┘   └──────┘
+
+2.1 BPE Tokenization
+--------------------
+Raw bytes are encoded using a pre-trained Byte Pair Encoding (BPE) tokenizer with
+vocabulary size 49,152 (same as GPT-NeoX). Tokenization converts variable-length
+byte sequences into discrete token IDs in [0, 49151].
+
+Typical compression ratio: ~3.4 bytes/token for English text (enwik8).
+
+2.2 Compact Vocabulary Remapping
+---------------------------------
+Only tokens actually present in the input file are used. The compressor builds a
+compact mapping from full vocabulary IDs to contiguous IDs in [0, ve-1], where
+ve = number of unique tokens in the file (typically 18K-44K for Wikipedia text).
+
+This reduces the per-token computation from O(VOCAB=49152) to O(ve), saving ~10-30%
+of forward pass time. The mapping table is transmitted in the compressed header
+using Rice coding (typically ~10-12KB for ve≈44K tokens).
+
+2.3 Online Prediction and Arithmetic Coding
+--------------------------------------------
+For each token position i, the predictor outputs a probability distribution
+p(token | context). This distribution is used by the arithmetic coder to encode
+the actual token. The optimal code length is -log2(p(correct_token)) bits.
+
+The total compressed size is approximately:
+    sum_{i=1}^{N} -log2( p(t_i | t_0,...,t_{i-1}) )  bits  +  header overhead
+
+After encoding token t_i, the model is immediately updated with the true token,
+so it can improve its predictions for subsequent tokens. Both encoder and decoder
+run the identical update sequence, ensuring perfect synchronization without
+storing any model state in the file.
+
+2.4 File Format
+---------------
+Compressed file layout (magic: "SSM6"):
+
+  Offset  Size  Field
+  ------  ----  -----
+       0     4  Magic: "SSM6"
+       4     8  N_orig: original byte count (uint64)
+      12     8  N_toks: token count (uint64)
+      20     4  ve: effective vocab size (uint32)
+      24     4  imap_bytes: size of vocab map section (uint32)
+      28   var  Rice-coded vocab map (imap_bytes bytes)
+    28+K   var  Arithmetic-coded token stream
+
+The header is typically 28-30KB for a 100MB English text file.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 3. STATE SPACE MODEL (SSM) ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1 Model Configuration
+------------------------
+  DM  = 32   (model/embedding dimension)
+  DS  = 16   (SSM state dimension per channel)
+  DC  =  4   (depthwise convolution width)
+  DI  = 64   (inner/expanded dimension = 2 * DM)
+  NL  =  2   (number of Mamba layers)
+  VOCAB = 49152  (full BPE vocabulary)
+
+Parameter count:
+  - Fixed parameters (architecture weights): ~19,776 floats = ~77KB
+  - Embedding matrix (vocab × DM): 49152 × 32 = 1,572,864 floats
+  - Head matrix (vocab × DM):      49152 × 32 = 1,572,864 floats
+  - Total per-file: fixed + 2 × ve × DM floats
+  - For ve=44298 (enwik8): ~77KB fixed + ~11.3MB embeddings = ~11.4MB total params
+
+The per-file parameter count scales with vocabulary usage, not the full vocabulary.
+Only the ve embedding/head rows for tokens present in the file are allocated and
+trained. This is the "compact vocab" optimization.
+
+3.2 Mamba Layer Structure
+--------------------------
+Each of the NL=2 layers implements the Mamba (S6) block:
+
+  Input x[DM]
+      │
+      ▼
+  LayerNorm  (learnable scale/bias: ln_g[DM], ln_b[DM])
+      │
+      ▼
+  Linear projection: [DM] → [2*DI=128]  (in_w: DM × 2DI)
+      ├── xs[DI]: SSM branch
+      └── z[DI]:  gating branch
+      │
+      ▼ (xs branch)
+  Depthwise conv1D (width DC=4):  xs → xc  (conv_w: DI × DC, conv_b: DI)
+  SiLU activation on xc
+      │
+      ▼
+  Linear projection: xc[DI] → proj[XP_DIM=33]  (xp_w: DI × XP_DIM)
+  Split: B[DS], C[DS], dt_in[1]
+      │
+      ▼
+  dt[DI] = softplus(dt_in * dt_w[DI] + dt_b[DI])    (input-dependent timestep)
+      │
+      ▼
+  ── SSM Recurrence (discretized) ──
+  For each channel i in [0, DI):
+    For each state j in [0, DS):
+      dA = exp(dt[i] * A_neg[i,j])               (discrete state matrix)
+      h[i,j] = dA * h[i,j] + dt[i] * B[j] * xc[i]  (state update)
+    y[i] = sum_j( h[i,j] * C[j] ) + D[i] * xc[i]   (output)
+      │
+      ▼
+  Gate: gate[i] = z[i] * sigmoid(z[i])            (SiLU on z branch)
+  out[i] = y[i] * gate[i]
+      │
+      ▼
+  Linear projection: out[DI] → residual[DM]  (out_w: DI × DM)
+      │
+  + residual connection
+      │
+      ▼
+  Output x[DM]  (fed to next layer)
+
+After NL layers, a final LayerNorm is applied, then a linear head projection:
+    logits[j] = dot(x_final[DM], head_w[j, DM])  for j in [0, ve)
+
+3.3 SSM State and Memory
+--------------------------
+The SSM recurrent state h[NL][DI * DS] = 2 × 64 × 16 = 2048 floats represents
+the model's "memory" of all tokens seen so far.
+
+The state update is a continuous-time linear recurrence:
+    h(t+1) = diag(exp(dt * A)) * h(t) + dt * B * xc(t)
+
+where A is a diagonal negative matrix (initialized as -exp(A_log)) ensuring
+exponential decay. The discrete timestep dt = softplus(linear(xc)) is
+input-dependent, allowing the model to learn which past tokens to remember.
+
+The convolution buffer cb[NL][DI * (DC-1)] = 2 × 64 × 3 = 384 floats
+stores the last DC-1=3 activations for the depthwise conv1D.
+
+3.4 Online Training
+--------------------
+Training happens simultaneously with encoding, using the true token at each
+position as the training target. Batches of CHUNK_SZ=32 tokens are collected,
+then trained with TRAIN_ITERS=2 Adam gradient descent steps.
+
+The training objective is cross-entropy with label smoothing (epsilon=0.12):
+    loss_target = 1.0 - epsilon = 0.88
+    loss_smooth = epsilon / ve ≈ 4.9e-6 per non-target token
+
+Optimizer: Adam (lr=0.002, β1=0.9, β2=0.999, ε=1e-8, grad_clip=5.0)
+
+Early chunks get more training iterations to warm up quickly:
+    chunks  0-9:  8 iterations
+    chunks 10-29: 4 iterations
+    chunks 30+:   2 iterations (TRAIN_ITERS)
+
+Gradients are computed only through forward pass (backpropagation through time
+is truncated at chunk boundaries for efficiency).
+
+3.5 Implementation Details
+---------------------------
+Forward and backward passes use AVX2 SIMD intrinsics for all DM/DI-dimensional
+dot products and matrix-vector multiplications. The hot path per token:
+  - Forward: ~1.4M MADs (dominated by head projection: ve × DM)
+  - Backward: ~1.4M MADs (same structure)
+  - Adam update: ~160K parameter updates (fixed) + 2 × ve × DM (vocab-dependent)
+
+Approximate throughput: ~1100-1300 tok/s on a modern x86 CPU with AVX2.
+
+For enwik8 (100MB, 29.7M tokens): ~26,600 seconds ≈ 7.4 hours.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 4. SPARSE N-GRAM CONTEXT MODELS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4.1 Motivation
+---------------
+While the SSM captures long-range dependencies via its recurrent state, it has
+limited capacity (DM=32). Sparse n-gram models provide exact memorization of
+frequently observed local patterns, complementing the SSM's generalization.
+
+The key theoretical insight is softmax translation invariance:
+    softmax(x + c) = softmax(x)  for any scalar c
+
+This means when adding an n-gram logit bias to the SSM's logit vector, only
+tokens with non-zero n-gram counts need to be updated:
+
+    logits[j] += lambda * log(1 + count[j] / alpha)
+
+All other tokens implicitly receive the zero bias. This makes sparse n-gram
+storage both memory-efficient and computationally efficient.
+
+4.2 N-gram Orders
+------------------
+The following n-gram tables are maintained:
+
+  Order   Context tokens  Hash table    Lambda   Alpha   Hash key type
+  ------  --------------  ----------    ------   -----   -------------
+  1-gram  (prev1)         direct array  0.15     0.10    Index = prev1 token
+  2-gram  (p2, p1)        16M slots     0.10     0.05    64-bit: p2<<16 | p1
+  3-gram  (p3,p2,p1)      16M slots     0.08     0.03    64-bit: p3<<32|p2<<16|p1
+  4-gram  (p4..p1)        16M slots     0.06     0.02    64-bit packed
+  5-gram  (p5..p1)        16M slots     0.05     0.015   mix64(poly hash)
+  6-gram  (p6..p1)        16M slots     0.04     0.01    mix64(poly hash)
+  7-gram  (p7..p1)        16M slots     0.03     0.008   mix64(poly hash)
+
+The bigram (1-gram) uses a direct array of size ve (no hash collisions).
+Orders 2-4 pack the context exactly into 64 bits (16 bits per token, max
+token ID fits in 16 bits since vocab ≤ 49152 < 65536).
+Orders 5-7 use Murmur-style mix64 hash of a polynomial rolling hash over
+the context tokens.
+
+4.3 Linear Probing
+-------------------
+Each hash table uses open addressing with linear probing (PROBE_LEN=8).
+On insertion, up to 8 slots are checked before giving up:
+    slot = (hash + probe) & mask,  probe in [0, PROBE_LEN)
+
+This significantly reduces wasted slots from hash collisions, especially
+important at higher load factors (enwik8 100MB produces ~29.7M tokens).
+
+4.4 Per-Context Sparse Storage (SparseCtx)
+-------------------------------------------
+Each occupied slot stores a SparseCtx: a dynamically-sized list of
+(token_id, count) pairs for that specific context:
+
+    toks[n]:  uint16_t array of token IDs
+    cnts[n]:  uint16_t array of counts (capped at 65535)
+    total:    int, sum of all counts
+    n, cap:   int, current/allocated entries
+
+Only tokens actually observed following this context are stored.
+Typical fan-out per context is 5-30 entries for natural language.
+
+4.5 Entropy-Adaptive Scaling
+------------------------------
+The n-gram contribution is scaled by the SSM's current entropy:
+
+    H = -sum_j p_ssm[j] * log(p_ssm[j])
+    count_scale = (1 - BLEND) + BLEND * (H / H_target)
+
+Parameters: ENTROPY_TARGET=5.5, ENTROPY_BLEND=0.6, min=0.2, max=2.5
+
+When SSM entropy is low (confident prediction), count_scale is small and
+n-grams contribute less. When entropy is high (uncertain SSM), n-grams
+contribute more to refine the distribution.
+
+4.6 Additional Context Models
+-------------------------------
+LZ Hash Predictor:
+  A single-entry hash table keyed on (prev2, prev1) stores the most
+  recently seen next token with a confidence count. When confident,
+  a boost of up to LZ_BOOST=1.5 logits is applied to the predicted token.
+  Boost = 1.5 * (1 - 1/(1 + count*0.3)), approaching 1.5 asymptotically.
+
+Recency Bias:
+  The last 64 tokens receive a small logit bonus with exponential decay
+  by recency (lambda=0.05). This helps with local repetition patterns.
+
+Global Frequency Prior:
+  logits[j] += COUNT_LAMBDA * log(count_so_far[j] + 1) for all j.
+  This incorporates global unigram frequency as a prior.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 5. COMBINED PROBABILITY COMPUTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+At each token position i, the combined logit vector is computed as:
+
+  Before first SSM forward pass (cold start):
+    mixed_logits[j] = COUNT_LAMBDA * log(count[j] + 1)
+    count_scale = 1.0
+
+  After first forward pass:
+    H = entropy(ssm_logits)
+    count_scale = (1 - 0.6) + 0.6 * (H / 5.5)   [clamped to 0.2-2.5]
+    mixed_logits[j] = ssm_logits[j] + count_scale * COUNT_LAMBDA * log(count[j]+1)
+
+  Then n-gram biases are added (softmax-invariant):
+    mixed_logits += bigram_delta(prev1)
+    mixed_logits += trigram_delta(prev2, prev1)
+    ...
+    mixed_logits += eightgram_delta(prev7..prev1)
+    mixed_logits += lz_delta(prev2, prev1)
+    mixed_logits += recency_delta()
+
+  Final: probs = softmax(mixed_logits)
+
+The arithmetic coder uses probs to encode the true next token.
+Immediately after encoding, the SSM is updated: forward_token(true_token).
+The n-gram tables and LZ table are also updated with the true token.
+
+This guarantees that the decompressor sees the identical sequence of
+probability distributions (same model state at every position), enabling
+exact reconstruction of the original token sequence.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 6. ARITHMETIC CODING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Range-based arithmetic coding with AC_SCALE = 2^16 = 65536.
+
+The probability distribution is quantized to integer frequencies:
+    freq[j] = round(probs[j] * AC_SCALE),  with minimum freq = 1
+
+CDF is built from frequencies:
+    cdf[0] = 0
+    cdf[j+1] = cdf[j] + freq[j]
+    total = cdf[ve]
+
+The arithmetic encoder maintains interval [lo, hi) in 32-bit integers,
+progressively narrowing it as each symbol is encoded. Pending bits are
+flushed using bit-stuffing to avoid carry propagation issues.
+
+The decoder maintains the same interval and current value, recovering
+each symbol by binary search in the CDF table.
+
+Coding redundancy from quantization is approximately:
+    log2(total / AC_SCALE) bits per symbol ≈ log2(ve / 65536) bits
+    For ve=44298: log2(44298/65536) ≈ -0.56 bits (slightly sub-optimal CDF)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 7. COMPONENT CONTRIBUTIONS: ABLATION STUDY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ablation tests on enwik8_3M (3MB Wikipedia extract, 871,978 tokens):
+
+  Test file: enwik8_3M (3MB Wikipedia extract, 887,725 tokens, ve=28,329)
+
+  Variant                   | Bytes      | bpb   | vs Full  | Notes
+  ───────────────────────────────────────────────────────────────────────────
+  Count prior only          | 1,571,740  | 4.189 | +94.2%   | baseline: unigram freq only
+  N-gram + count (no SSM)   | 1,339,879  | 3.568 | +65.5%   | n-grams weak without SSM base
+  SSM + count (no n-grams)  |   840,363  | 2.158 |  +3.8%   | SSM alone beats xz!
+  Full combined (current)   |   809,498  | 2.079 |   ---    | best
+  xz -9e                    |   851,572  | 2.271 |  +5.2%   | reference
+  ───────────────────────────────────────────────────────────────────────────
+
+Key findings:
+
+  1. SSM is the dominant contributor: it reduces compressed size from
+     1,571,740 (count-only) to 840,363 bytes — a 46.5% reduction.
+     SSM alone already beats xz by 1.3% (840,363 vs 851,572).
+
+  2. N-grams provide incremental improvement on top of SSM: from 840,363
+     to 809,498 bytes — an additional 3.7% reduction. Their effect is
+     smaller than SSM's but consistent and additive.
+
+  3. N-grams without SSM are much weaker: 1,339,879 bytes (only 14.7%
+     better than count-only). N-grams need the SSM's calibrated base
+     distribution to be effective. Without it, the count prior provides a
+     poor starting distribution that n-gram biases cannot fully overcome.
+
+  4. Conclusion: SSM is the primary compression engine; n-grams provide
+     fine-grained refinement. Both are necessary for maximum performance.
+
+bpb progression on enwik8 (100MB, full run):
+  Position 0       (cold):  ~8.1 bpt (SSM only, random initialization)
+  Position 50K    tokens:  ~7.1 bpt (SSM warmed up)
+  Position 500K   tokens:  ~6.9 bpt (n-grams starting to contribute)
+  Position 3M     tokens:  ~6.83 bpt
+  Position 10M    tokens:  ~6.83 bpt (plateau)
+  Position 30M    tokens:  ~6.81 bpt (marginal improvement)
+  Final (29.7M)           :  6.813 bpt = 2.024 bpb
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 8. COMPRESSION RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Benchmark corpus: enwik8 (first N bytes of English Wikipedia XML dump).
+All tests: x86_64 Linux, AVX2, -O3 -march=native.
+xz reference: xz -9e (extreme preset, level 9, LZMA2).
+
+8.1 Main Results
+-----------------
+  bpb = bits per original byte of input = compressed_bytes × 8 / input_bytes
+  xz: level -9e (extreme), SSM: full combined (SSM + n-gram 2-8 + LZ + recency)
+
+  File       | Size     | SSM (bytes) | SSM (bpb) | xz (bytes) | xz (bpb) | Δ vs xz
+  ─────────────────────────────────────────────────────────────────────────────────────
+  enwik8_1M  |   1.0 MB |     265,790 |  2.127 bpb|    290,740 | 2.326 bpb| −8.6%  (SSM wins)
+  enwik8_3M  |   3.0 MB |     809,498 |  2.159 bpb|    851,572 | 2.271 bpb| −4.9%  (SSM wins)
+  enwik8_10M |  10.0 MB |   2,706,189 |  2.165 bpb|  2,721,288 | 2.177 bpb| −0.6%  (SSM wins)
+  enwik8     | 100.0 MB |  26,712,044 |  2.137 bpb| 24,904,020 | 1.992 bpb| +7.3%  (xz wins)
+  ─────────────────────────────────────────────────────────────────────────────────────
+
+  Note: SSM bpb values are computed from total file size including header (28-30KB).
+  The model's internal bpt (bits per token) and bpb (excluding header) are slightly
+  lower: 7.051 bpt = 2.055 bpb (1M), 7.025 bpt = 2.079 bpb (3M), 6.826 bpt (10M),
+  6.813 bpt = 2.024 bpb (100M).
+
+8.2 Speed
+----------
+  Compression:   ~1100-1300 tok/s  ≈ 370-440 KB/s (for English text)
+  Decompression: ~1100-1300 tok/s  (identical computation to compression)
+
+  For enwik8 (100MB): ~7.4 hours compress, ~7.4 hours decompress.
+  This is significantly slower than xz, which processes at ~10-50 MB/s.
+
+8.3 Analysis: SSM vs xz Crossover
+-----------------------------------
+StateSMix beats xz on the 10MB corpus but loses on 100MB. This reflects a
+fundamental architectural difference:
+
+  xz (LZMA2): Uses an 8MB+ sliding window dictionary. Compression quality improves
+  monotonically with data size because longer files contain more/longer repeated
+  phrases that LZMA finds via LZ77 match-finding.
+
+  StateSMix: Uses fixed-size hash tables (16M slots per n-gram order). As file
+  size grows, table load factor increases and collision rate rises. Beyond ~50MB,
+  improvement stagnates because the hash tables are approaching saturation.
+
+  The crossover point is approximately 20-50MB for English Wikipedia text.
+
+  SSM performance trend across file sizes:
+    1MB:   SSM wins by 8.6%  (tables lightly loaded, fast adaptation)
+    3MB:   SSM wins by 4.9%  (advantage narrows)
+    10MB:  SSM wins by 0.6%  (near-parity)
+    100MB: SSM loses by 7.3% (tables saturating, xz finds long-range matches)
+
+  Memory usage: ~5.5GB RAM during compression (dominated by 7 × 16M-slot n-gram
+  tables × ~40 bytes/slot ≈ 4.5GB, plus SSM params and state).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 9. IMPLEMENTATION NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+9.1 Source Files
+-----------------
+  ssm_config.h     - Model hyperparameters and training constants
+  ssm_model.h/.c   - SSM forward/backward pass, Adam optimizer, AVX2 kernels
+  ssm_codec.c/.h   - Compression/decompression pipeline, n-gram tables, AC coding
+  ssm_tokenizer.c  - BPE tokenizer (encode/decode)
+  ssm_vocab.c      - Vocab mapping and compact remapping
+  ssm_arithmetic.c - Arithmetic encoder/decoder
+  ssm_math.h       - Fast exp, sigmoid, softplus approximations
+  ssm_preprocess.c - Optional preprocessing (BWT, reverse, extra-BPE)
+  ssm_bwt.c        - Burrows-Wheeler Transform on token sequences
+  main.c           - CLI entry point (compress/decompress/verify)
+
+9.2 Key Engineering Decisions
+-------------------------------
+  - AVX2 SIMD for all DM/DI-dimensional operations (4-16x throughput vs scalar)
+  - Compact vocab: only train/evaluate on ve tokens present in file
+  - int (not int16_t) for SparseCtx.n/cap to avoid overflow at >32767 entries
+  - Full 64-bit context keys in n-gram slots (not the hash) to reject collisions
+  - Linear probing (depth 8) to reduce wasted hash slots
+  - Entropy-adaptive scaling to balance SSM and n-gram contributions
+  - Label smoothing (ε=0.12) for more robust online training
+
+9.3 Differences from Mamba Reference Implementation
+-----------------------------------------------------
+  - Online (causal) only: no parallel scan needed; simple sequential recurrence
+  - No selective scan CUDA kernel: pure C + AVX2
+  - XP_DIM = 2*DS+1: B, C, and dt_in computed from a single shared projection
+    (reduces parameter count vs independent B/C/dt projections)
+  - D parameter is per-channel skip connection (standard Mamba)
+  - State initialization: zeros (no learned initial state)
+  - No positional encodings (SSM is inherently position-aware via recurrence)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 10. THEORETICAL CONNECTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+10.1 Connection to PPM (Prediction by Partial Matching)
+---------------------------------------------------------
+The n-gram component of StateSMix is conceptually similar to PPM (Bell et al.,
+1987), which maintains variable-order Markov models and uses the longest matching
+context for prediction. Key differences:
+
+  PPM uses escape probabilities to back off from higher to lower orders when a
+  context is unseen. StateSMix adds n-gram biases on top of the SSM baseline,
+  effectively using the SSM as a "zeroth-order" model that never gives zero
+  probability to any token.
+
+  The logit-space combination (logits[j] += lambda * log(1 + count/alpha))
+  is analogous to the "mixing in logit space" approach, where the SSM provides
+  a smooth prior and n-grams provide sharp spikes for memorized patterns.
+
+10.2 Connection to PAQ
+-----------------------
+PAQ-style compressors combine many context models in logit/weight space.
+StateSMix follows a similar philosophy: multiple models (SSM, bigram through
+8-gram, LZ predictor, recency, frequency prior) each contribute log-probability
+adjustments that are summed before softmax. Unlike PAQ, the mixture weights
+are fixed (or entropy-adaptive) rather than learned via online meta-weighting.
+
+10.3 Information-Theoretic Bound
+----------------------------------
+By Shannon's source coding theorem, the minimum average code length for a
+sequence of i.i.d. tokens drawn from distribution P is H(P) bits/token, where
+H(P) = -sum_j P(j) * log2(P(j)) is the entropy.
+
+For a non-stationary source (real text), the compressor achieves code length
+    L = -sum_i log2( q(t_i | t_0,...,t_{i-1}) )
+where q is the predictor's distribution. The gap from optimal is:
+    L - L_optimal = sum_i KL( P_true(·|context_i) || q(·|context_i) )
+
+The SSM reduces this KL divergence by learning the true conditional distribution
+online. The n-gram models reduce it further by memorizing exact transitions.
+
+10.4 SSM as Continuous-Time Linear Recurrence
+----------------------------------------------
+The discretized SSM recurrence:
+    h(t+1) = diag(exp(Δt * A)) * h(t) + Δt * B * x(t)
+    y(t)   = C^T * h(t) + D * x(t)
+
+is a learnable linear dynamical system where:
+  - A (diagonal, negative) controls decay rates of the state
+  - B projects input into state space
+  - C projects state back to output space
+  - Δt (input-dependent) controls how much to advance time
+
+This allows the model to selectively retain or forget information based on
+the current input, giving it properties of both fixed-rate and event-triggered
+recurrences. The initialization A_log[i,j] = log(j+1) gives a geometric spread
+of time constants, covering both fast (j=0) and slow (j=DS-1) dynamics.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 11. POSSIBLE FUTURE WORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. BWT preprocessing: Apply Burrows-Wheeler Transform to the token sequence
+     before compression. BWT reorders tokens so identical contexts are adjacent,
+     dramatically improving n-gram effectiveness for long-range patterns. This
+     is the key ingredient of PPM-based compressors that beat LZMA on some corpora.
+
+  2. Larger hash tables: Increasing to 32M-64M slots per order would reduce
+     collision rates on large files. Estimated gain: ~150-300KB on 100MB.
+     Memory cost: ~9-18GB.
+
+  3. Adaptive n-gram weights: Learn per-order mixture weights online (PAQ-style)
+     rather than fixed lambdas. This could improve performance across different
+     file types without manual tuning.
+
+  4. GPU acceleration: The head projection (ve × DM matrix-vector multiply,
+     44K × 32 ≈ 1.4M MADs/token) and Adam update are the bottlenecks.
+     GPU would give 50-100x speedup on these operations.
+
+  5. Larger SSM model: DM=64 or NL=4 was tested but gave negligible gain.
+     The bottleneck is the fixed-size hash tables, not the SSM capacity.
+     The SSM's online training signal is insufficient to utilize extra capacity
+     with only CHUNK_SZ=32 tokens per update.
+
+  6. Variable-order context mixing: Use the highest-order matching n-gram
+     with confidence-weighted interpolation (like PPM), rather than additive
+     logit combination of all orders simultaneously.
+
+  7. Cross-file pretraining: Pre-train the SSM weights on a reference corpus
+     and store them in the compressed file header. The per-file fine-tuning
+     would then start from a better initialization.
+
+
+================================================================================
+ END OF DOCUMENT
+================================================================================

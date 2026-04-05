@@ -1,0 +1,30 @@
+# Build artifacts
+*.o
+*.a
+ssm_best_version2
+ssm_baseline
+ssm_exp*
+ssm_profile
+ssm_tmp
+
+# Compressed outputs
+*.ssm
+
+# Test data
+enwik8*
+alice29*
+
+# LaTeX build
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.pdf
+
+# Editor
+*~
+*.swp
+.vscode/
