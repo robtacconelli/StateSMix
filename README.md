@@ -17,22 +17,7 @@ StateSMix beats xz on all file sizes up to 10 MB.
 
 ### Compression Landscape (enwik8 100 MB)
 
-```
-    bpb (bits per byte) — lower is better
-    ├─────────────────────────────────────────────────────┤
-    0         1         2         3
-
-    Nacrith (SmolLM2+mixing, 135M)  ████████▊                          0.939
-    FineZip (LLaMA-3-8B)            █████████▌                         1.024
-    ts_zip (RWKV-169M)              ██████████▍                        1.11
-    CMIX v21 (LSTM+mixing)          ███████████                        1.17
-    NNCP v3 (Transformer-XL)        ███████████▏                       1.19
-    PAQ8px (context mixing)         ████████████                       1.27
-    xz -9e (LZMA2)                  ██████████████████▊                1.989
-    ► StateSMix (ours)              ████████████████████               2.130
-    bzip2                           █████████████████████▊             2.321
-    gzip                            ███████████████████████████▍       2.916
-```
+![Benchmark Chart](benchmark_chart.png)
 
 | System | Type | Params | bpb | GPU | Self-contained |
 |--------|------|--------|-----|-----|----------------|
