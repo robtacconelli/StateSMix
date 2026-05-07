@@ -4,7 +4,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.02904-b31b1b.svg)](https://arxiv.org/abs/2605.02904)
 
-📄 **Paper**: [StateSMix: Online Lossless Compression via Mamba State Space Models and Sparse N-gram Context Mixing](https://arxiv.org/abs/2605.02904) (arXiv:2605.02904, submitted 5 Apr 2026) by [Roberto Tacconelli](https://arxiv.org/search/cs?searchtype=author&query=Tacconelli,+R).
+📄 **Paper**: [StateSMix: Online Lossless Compression via Mamba State Space Models and Sparse N-gram Context Mixing](https://arxiv.org/abs/2605.02904) (arXiv:2605.02904, submitted 5 Apr 2026)
 
 StateSMix is a fully self-contained lossless compressor combining an online-trained Mamba SSM with sparse n-gram logit biasing (bigram through 32-gram) and arithmetic coding. No pre-trained weights, no GPU, and no external dependencies are required.
 
